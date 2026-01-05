@@ -23,7 +23,7 @@ A simple SSH connection manager that uses tmux, fzf, and tailscale to provide a 
 
 1.  **Download the script and make it executable:**
     ```bash
-    git clone https://github.com/tommyh1/ssh-manager.git
+    git clone https://github.com/knarrlab/ssh-manager.git
     cd ssh-manager
     chmod +x ssh-manager
     ```
