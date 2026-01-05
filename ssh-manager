@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────
+# REQUIREMENTS
+# ─────────────────────────────────────────────
+for cmd in tmux fzf awk sed tailscale bash ssh; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "Missing required command: $cmd" >&2
+    exit 1
+  }
+done
+
+CONFIG="$HOME/.ssh/config"
+EDITOR="${EDITOR:-vim}"
+
+TMUX_SESSION="ssh"
+MANAGER_WINDOW="manager"
+
+MODE="run"
+case "${1:-}" in
+  --sync) MODE=sync ;;
+  --add)  MODE=add ;;
+  --edit) MODE=edit ;;
+  --install) MODE=install ;;
+  --uninstall) MODE=uninstall ;;
+esac
+
+mkdir -p "${CONFIG%/*}"
+
+# ─────────────────────────────────────────────
+# FUNCTIONS (DEFINED FIRST!)
+# ─────────────────────────────────────────────
+
+sync_from_tailscale() {
+  local port="${1:-22}"
+
+  echo "Syncing SSH config from Tailscale (port $port)…"
+
+  touch "$CONFIG"
+  chmod 600 "$CONFIG"
+
+  tailscale status |
+    awk '$1 ~ /^[0-9]+\./ && $5 !~ /^offline/ { print $2, $1 }' |
+    while read -r host ip; do
+      grep -q "^Host $host$" "$CONFIG" && continue
+
+      cat >>"$CONFIG" <<EOF
+
+Host $host
+  HostName $ip
+  User $(whoami)
+  Port $port
+EOF
+      echo "  added: $host ($ip)"
+    done
+}
+
+add_host() {
+  read -rp "Alias: " alias
+  read -rp "Host/IP: " host
+  read -rp "User [$(whoami)]: " user
+  read -rp "Port [22]: " port
+
+  cat >>"$CONFIG" <<EOF
+
+Host $alias
+  HostName $host
+  User ${user:-$(whoami)}
+  Port ${port:-22}
+EOF
+
+  echo "Host '$alias' added."
+}
+
+install_script() {
+  local script_name
+  script_name=$(basename "$0")
+  local install_path="/usr/local/bin/$script_name"
+  local script_dir
+  script_dir=$(dirname "$(readlink -f "$0")") # Get the real directory of the executed script
+
+  read -rp "Install $script_name to $install_path? [y/N] " choice
+  case "$choice" in
+    y|Y )
+      sudo mv -v "$0" "$install_path"
+      echo "$script_name installed."
+      ;;
+    * )
+      echo "Installation aborted."
+      echo "You can delete /home/$USER/ssh-manager"
+      ;;
+  esac
+}
+
+uninstall_script() {
+  local script_name="ssh-manager"
+  local install_path="/usr/local/bin/$script_name"
+
+  if [[ ! -f "$install_path" ]]; then
+      echo "Error: $script_name is not installed at $install_path."
+      exit 1
+  fi
+
+  read -rp "Uninstall $script_name from $install_path? [y/N] " choice
+  case "$choice" in
+    y|Y )
+      sudo rm "$install_path"
+      echo "$script_name uninstalled."
+
+      read -rp "WARNING: This will delete your SSH configuration file ($CONFIG). Are you sure? [y/N] " confirm_config_delete
+      case "$confirm_config_delete" in
+        y|Y )
+          rm "$CONFIG"
+          echo "SSH configuration file ($CONFIG) deleted."
+          ;;
+        * )
+          echo "SSH configuration file not deleted."
+          ;;
+      esac
+      ;;
+    * )
+      echo "Uninstallation aborted."
+      ;;
+  esac
+}
+
+edit_config() {
+  exec "$EDITOR" "$CONFIG"
+}
+
+first_run_guard() {
+  if [[ -s "$CONFIG" ]]; then
+    return
+  fi
+
+  echo
+  echo "No SSH config found."
+  echo
+  echo "You need to add hosts first."
+  echo "Choose one:"
+  echo "  1) Sync hosts from Tailscale"
+  echo "  2) Add a host manually"
+  echo "  q) Quit"
+  echo
+
+  read -rp "Choice: " choice
+
+  case "$choice" in
+    1)
+      read -rp "Default SSH port for new hosts [22]: " DEFAULT_PORT
+      DEFAULT_PORT="${DEFAULT_PORT:-22}"
+      sync_from_tailscale "$DEFAULT_PORT"
+      echo
+      echo "Hosts synced. Re-run ssh-manager."
+      exit 0
+      ;;
+    2)
+      add_host
+      exit 0
+      ;;
+    *)
+      echo "Aborted."
+      exit 0
+      ;;
+  esac
+}
+
+cleanup() { stty sane 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+# ─────────────────────────────────────────────
+# TMUX BOOTSTRAP
+# ─────────────────────────────────────────────
+if [[ "$MODE" == "run" && -z "${TMUX:-}" && -z "${SSHM_IN_TMUX:-}" ]]; then
+  first_run_guard
+
+  if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    if tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' \
+       | grep -qx "$MANAGER_WINDOW"; then
+      tmux select-window -t "$TMUX_SESSION:$MANAGER_WINDOW"
+    else
+      tmux new-window -t "$TMUX_SESSION" -n "$MANAGER_WINDOW" \
+        "SSHM_IN_TMUX=1 exec $0"
+    fi
+    exec tmux attach -t "$TMUX_SESSION"
+  else
+    exec tmux new-session \
+      -s "$TMUX_SESSION" \
+      -n "$MANAGER_WINDOW" \
+      "SSHM_IN_TMUX=1 exec $0"
+  fi
+fi
+
+# ─────────────────────────────────────────────
+# MODE HANDLING (NON-RUN)
+# ─────────────────────────────────────────────
+case "$MODE" in
+  sync)
+    read -rp "Default SSH port for new hosts [22]: " p
+    sync_from_tailscale "${p:-22}"
+    exit 0
+    ;;
+  add)
+    add_host
+    exit 0
+    ;;
+  edit)
+    edit_config
+    exit 0
+    ;;
+  install)
+    install_script
+    exit 0
+    ;;
+  uninstall)
+    uninstall_script
+    exit 0
+    ;;
+esac
+
+# ─────────────────────────────────────────────
+# BUILD MENU
+# ─────────────────────────────────────────────
+build_menu() {
+  echo "!!DETACH!!  [ detach ]"
+  echo
+
+  awk '
+    BEGIN { host=""; ip="?"; port="22" }
+
+    $1=="Host" && $2!="*" {
+      host=$2; ip="?"; port="22"
+    }
+    $1=="HostName" { ip=$2 }
+    $1=="Port"     { port=$2 }
+
+    /^[[:space:]]*$/ && host!="" {
+      printf "%-15s %-15s :%s\n", host, ip, port
+      host=""
+    }
+
+    END {
+      if (host!="")
+        printf "%-15s %-15s :%s\n", host, ip, port
+    }
+  ' "$CONFIG" | sort
+}
+
+choose() {
+  set +e
+  local out rc
+  out=$(fzf --prompt="ssh > " --reverse)
+  rc=$?
+  set -e
+  [[ $rc -eq 0 || $rc -eq 130 ]] || exit $rc
+  echo "$out"
+}
+
+# ─────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────
+while true; do
+  SEL=$(build_menu | choose)
+  [[ -z "$SEL" ]] && continue
+
+  [[ "$SEL" == '!!DETACH!!'* ]] && { tmux detach; continue; }
+
+  HOST=$(awk '{print $1}' <<<"$SEL")
+
+  tmux new-window -d -n "$HOST" \
+    "bash -l -c 'ssh -X $HOST; exec bash'"
+
+  tmux select-window -t "$TMUX_SESSION:$HOST"
+done
